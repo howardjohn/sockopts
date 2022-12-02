@@ -1,11 +1,10 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{
-    macros::map,
-    maps::HashMap,
-};
+use core::ptr::slice_from_raw_parts;
+use aya_bpf::{macros::map, maps::HashMap, memcpy};
 use aya_bpf::{bpf_printk, macros::cgroup_sockopt, programs::SockoptContext};
+use aya_bpf::cty::{c_int, c_void};
 
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -96,6 +95,7 @@ fn try_sockopts(ctx: SockoptContext) -> Result<i32, i32> {
         }
         let mut ol = (*ctx.sockopt).optlen;
         ol = 1;
+        (*ctx.sockopt).optlen = id.len() as c_int;
         // ((*ctx.sockopt).__bindgen_anon_2.optval) = data.as_ptr() as *mut c_void;
         bpf_printk!(b"get sock name %d", (*ctx.sockopt).optname);
         bpf_printk!(b"get sock len %d", (*ctx.sockopt).optlen);
@@ -115,7 +115,9 @@ fn try_set_sockopts(ctx: SockoptContext) -> Result<i32, i32> {
         bpf_printk!(b"set SOL_CUSTOM %d", (*ctx.sockopt).level);
     }
     unsafe {
-        if (*ctx.sockopt).__bindgen_anon_2.optval as usize + 16 > (*ctx.sockopt).__bindgen_anon_3.optval_end as usize {
+        if (*ctx.sockopt).__bindgen_anon_2.optval as usize + 255 > (*ctx.sockopt).__bindgen_anon_3.optval_end as usize {
+            let l = (*ctx.sockopt).__bindgen_anon_3.optval_end as usize - (*ctx.sockopt).__bindgen_anon_2.optval as usize;
+            bpf_printk!(b"big length X %d", l);
             return Ok(0);
         }
     }
@@ -127,15 +129,31 @@ fn try_set_sockopts(ctx: SockoptContext) -> Result<i32, i32> {
             saddr: sk.dst_ip4,
             sport: u16::from_be(sk.dst_port) as u32,
         };
-        let mut id: [u8; 256] = [0; 256];
-        for (i, b) in b"from ebpf".iter().enumerate() {
-            id[i] = *b;
+        let l = (*ctx.sockopt).__bindgen_anon_3.optval_end as usize - (*ctx.sockopt).__bindgen_anon_2.optval as usize;
+        if l < 0 {
+            bpf_printk!(b"negative length");
+            return Ok(0)
         }
-        // if let Err(e) = id.writer().write_all(b"from bpf") {
-        //     return Ok(0);
-        // }
+        if l > 256 {
+            bpf_printk!(b"big length %d", l);
+            return Ok(0)
+        }
+        if l < 200 {
+            bpf_printk!(b"small length");
+            return Ok(0)
+        }
+
+        let mut id: [u8; 256] = [0; 256];
+        let v = (*ctx.sockopt).__bindgen_anon_2.optval;
+        let idm = id.as_mut_ptr();
+        v.copy_to(idm as *mut c_void, 256);
+
+        let mut id2 = [0; 256];
+        for i in 0..28 { // WTF?? why 28?
+            id2[i] = id[i];
+        }
         let meta = Metadata{
-            identity: id,
+            identity: id2,
         };
         if let Err(e) = HOWARDJOHN_MAP.insert(&ct, &meta, 0u64) {
             return Ok(0);

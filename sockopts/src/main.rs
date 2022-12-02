@@ -58,6 +58,14 @@ pub struct Metadata {
 
 unsafe impl aya::Pod for Metadata {}
 
+fn get_id(s: &[u8]) -> [u8; 256] {
+    let mut id: [u8; 256] = [0; 256];
+    for (i, b) in s.iter().enumerate() {
+        id[i] = *b;
+    }
+    id
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), anyhow::Error> {
     let opt = Opt::parse();
@@ -82,17 +90,13 @@ async fn main() -> Result<(), anyhow::Error> {
     // }
 
     let mut metadata: HashMap<_, ConnectionTuple, Metadata> = HashMap::try_from(bpf.map_mut("HOWARDJOHN_MAP")?)?;
-    let mut id: [u8; 256] = [0; 256];
-    for (i, b) in b"manual".iter().enumerate() {
-        id[i] = *b;
-    }
     metadata.insert(ConnectionTuple {
         daddr: 1,
         dport: 2,
         saddr: 3,
         sport: 4,
     }, Metadata {
-        identity: id,
+        identity: get_id(b"manual"),
     }, 0).unwrap();
     let program: &mut CgroupSockopt = bpf.program_mut("get_sockopts").unwrap().try_into()?;
     let cgroup = std::fs::File::open(opt.cgroup_path.clone())?;
@@ -112,8 +116,8 @@ async fn main() -> Result<(), anyhow::Error> {
         info!("connecting");
         let s = TcpStream::connect(addr).await.unwrap();
         unsafe {
-            let mut optval: [libc::c_uchar; 8] = [0; 8];
-            let mut sz = (mem::size_of_val(&optval) * 16) as libc::socklen_t;
+            let mut optval: [libc::c_uchar; 256] = [0; 256];
+            let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
             let ret = libc::getsockopt(
                 s.as_raw_fd(),
                 // libc::SOL_SOCKET,
@@ -129,12 +133,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 warn!("{:?}", io::Error::last_os_error());
             }
             warn!("got val ret={ret} optval={optval:?}");
-            warn!("string val: {:?}", std::str::from_utf8(&optval));
+            warn!("string val: {:?}", str_from_null_terminated_utf8_safe(&optval[..sz as usize]));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
         unsafe {
-            let mut optval: [libc::c_uchar; 11] = b"hello world".map(|b| b as libc::c_uchar);
-            let mut sz = (mem::size_of_val(&optval) * 16) as libc::socklen_t;
+            let mut optval: [libc::c_uchar; 256] = get_id(b"from userspace").map(|b| b as libc::c_uchar);
+            let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
             let ret = libc::setsockopt(
                 s.as_raw_fd(),
                 #[allow(overflowing_literals)]
@@ -163,7 +167,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 panic!("ret={ret} {:?}", io::Error::last_os_error());
             }
             warn!("got val ret={ret} optval={optval:?}");
-            warn!("string val: {:?}", std::str::from_utf8(&optval));
+            warn!("string val: {:?}", str_from_null_terminated_utf8_safe(&optval[..sz as usize]));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
@@ -210,4 +214,22 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("Exiting...");
 
     Ok(())
+}
+
+fn str_from_null_terminated_utf8_safe(s: &[u8]) -> &str {
+    if s.iter().any(|&x| x == 0) {
+        unsafe { str_from_null_terminated_utf8(s) }
+    } else {
+        std::str::from_utf8(s).unwrap()
+    }
+}
+
+// unsafe: s must contain a null byte
+unsafe fn str_from_null_terminated_utf8(s: &[u8]) -> &str {
+    std::ffi::CStr::from_ptr(s.as_ptr() as *const _).to_str().unwrap()
+}
+
+// unsafe: s must contain a null byte, and be valid utf-8
+unsafe fn str_from_null_terminated_utf8_unchecked(s: &[u8]) -> &str {
+    std::str::from_utf8_unchecked(std::ffi::CStr::from_ptr(s.as_ptr() as *const _).to_bytes())
 }
