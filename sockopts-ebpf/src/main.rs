@@ -1,7 +1,36 @@
 #![no_std]
 #![no_main]
 
+use aya_bpf::{
+    macros::map,
+    maps::HashMap,
+};
 use aya_bpf::{bpf_printk, macros::cgroup_sockopt, programs::SockoptContext};
+
+
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct ConnectionTuple {
+    pub daddr: u32,
+    pub dport: u32,
+    pub saddr: u32,
+    pub sport: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+pub struct Metadata {
+    pub identity: [u8; 256]
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BackendKey {}
+
+
+#[map(name = "HOWARDJOHN_MAP")]
+static mut HOWARDJOHN_MAP: HashMap<ConnectionTuple, Metadata> = HashMap::<ConnectionTuple, Metadata>::with_max_entries(128, 0);
+#[map(name = "HOWARDJOHN_MAP2")]
+static mut HOWARDJOHN_MAP2: HashMap<ConnectionTuple, u16> = HashMap::<ConnectionTuple, u16>::with_max_entries(128, 0);
 
 #[cgroup_sockopt(getsockopt, name = "get_sockopts")]
 pub fn get_sockopts(ctx: SockoptContext) -> i32 {
@@ -39,20 +68,30 @@ fn try_sockopts(ctx: SockoptContext) -> Result<i32, i32> {
     // Override kernel error
     unsafe { (*ctx.sockopt).retval = 0 };
     unsafe {
-        let data: &mut [u8; 1] = &mut [101; 1];
-        if (*ctx.sockopt).__bindgen_anon_2.optval as usize + 128 > (*ctx.sockopt).__bindgen_anon_3.optval_end as usize {
+        let sk = *((*ctx.sockopt).__bindgen_anon_1.sk);
+        bpf_printk!(b"get dip %d", u32::from_be(sk.dst_ip4));
+        bpf_printk!(b"get dport %d", u16::from_be(sk.dst_port));
+        let ct = ConnectionTuple{
+            daddr: sk.dst_ip4,
+            dport:  u16::from_be(sk.dst_port) as u32,
+            saddr: sk.dst_ip4,
+            sport: u16::from_be(sk.dst_port) as u32,
+        };
+        let id = if let Some(m) = HOWARDJOHN_MAP.get(&ct) {
+            bpf_printk!(b"get identity %d", m.identity[0]);
+            m.identity
+        } else {
+            bpf_printk!(b"failed identity");
+            return Ok(0)
+        };
+        if (*ctx.sockopt).__bindgen_anon_2.optval as usize + 256 > (*ctx.sockopt).__bindgen_anon_3.optval_end as usize {
+
+            bpf_printk!(b"small opt %d", (*ctx.sockopt).__bindgen_anon_3.optval_end as usize - (*ctx.sockopt).__bindgen_anon_2.optval as usize);
             return Ok(0);
         }
-        // let mut val = 1;
-        // let d = &val as *mut c_void;
-        // *((*ctx.sockopt).__bindgen_anon_2.optval) = *d;
-        // core::ptr::copy_nonoverlapping(data.as_ptr(), ((*ctx.sockopt).__bindgen_anon_2.optval) as *mut u8, 6);
-        // if (*ctx.sockopt).optlen > 3 {
-        //     (*ctx.sockopt).optlen = 3;
-        // }
         let mut ov = (*ctx.sockopt).__bindgen_anon_2.optval;
-        for v in b"hello" {
-            ov.write_bytes(*v, 1);
+        for v in id {
+            ov.write_bytes(v, 1);
             ov = ov.offset(1)
         }
         let mut ol = (*ctx.sockopt).optlen;
@@ -80,6 +119,29 @@ fn try_set_sockopts(ctx: SockoptContext) -> Result<i32, i32> {
             return Ok(0);
         }
     }
+    unsafe {
+        let sk = *((*ctx.sockopt).__bindgen_anon_1.sk);
+        let ct = ConnectionTuple{
+            daddr: sk.dst_ip4,
+            dport:  u16::from_be(sk.dst_port) as u32,
+            saddr: sk.dst_ip4,
+            sport: u16::from_be(sk.dst_port) as u32,
+        };
+        let mut id: [u8; 256] = [0; 256];
+        for (i, b) in b"from ebpf".iter().enumerate() {
+            id[i] = *b;
+        }
+        // if let Err(e) = id.writer().write_all(b"from bpf") {
+        //     return Ok(0);
+        // }
+        let meta = Metadata{
+            identity: id,
+        };
+        if let Err(e) = HOWARDJOHN_MAP.insert(&ct, &meta, 0u64) {
+            return Ok(0);
+        }
+    }
+
     unsafe {
         bpf_printk!(b"set SOL_CUSTOM %d", (*ctx.sockopt).level);
 
