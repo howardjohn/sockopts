@@ -1,15 +1,19 @@
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aya::{Bpf, include_bytes_aligned};
 use aya::maps::HashMap;
 use aya::programs::CgroupSockopt;
+use aya_log::BpfLogger;
 use clap::Parser;
 use log::{info, warn};
+use socket2::{Domain, Socket, Type};
 use tokio::{io, select, signal};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Parser)]
@@ -85,8 +89,8 @@ async fn main() -> Result<(), anyhow::Error> {
         "../../target/bpfel-unknown-none/release/sockopts"
     ))?;
     // if let Err(e) = BpfLogger::init(&mut bpf) {
-    //     // This can happen if you remove all log statements from your eBPF program.
-    //     warn!("failed to initialize eBPF logger: {}", e);
+    //     This can happen if you remove all log statements from your eBPF program.
+        // warn!("failed to initialize eBPF logger: {}", e);
     // }
 
     let mut metadata: HashMap<_, ConnectionTuple, Metadata> = HashMap::try_from(bpf.map_mut("HOWARDJOHN_MAP")?)?;
@@ -110,11 +114,42 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("Waiting for Ctrl-C...");
 
     let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let (srv_tx, srv_rx) = oneshot::channel::<()>();
     let client = tokio::spawn(async move {
         // return;
-        // tokio::time::sleep(Duration::from_millis(250)).await;
-        info!("connecting");
-        let s = TcpStream::connect(addr).await.unwrap();
+        srv_rx.await;
+        let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        info!("creating socket...");
+        s.connect(&addr.into()).unwrap();
+        unsafe {
+            let mut optval: [libc::c_uchar; 256] = get_id(b"from userspace").map(|b| b as libc::c_uchar);
+            let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
+            let ret = libc::setsockopt(
+                s.as_raw_fd(),
+                #[allow(overflowing_literals)]
+                    0xdeadbeef,
+                12,
+                &optval as *const _ as *const libc::c_void,
+                mem::size_of_val(&optval) as libc::socklen_t,
+            );
+            warn!("setsock got val ret={ret} optval={optval:?}");
+            if ret != 0 && ret != -1 {
+                panic!("set sock opt: {:?}", io::Error::last_os_error());
+            }
+        }
+        info!("set sock opt done");
+        info!("connected.");
+        rx.await
+    });
+
+    let m = Arc::new(Mutex::new(metadata));
+    let mm = m.clone();
+    let server: JoinHandle<()> = tokio::spawn(async move {
+        let l = TcpListener::bind(addr).await.unwrap();
+        drop(srv_tx);
+        let (s, _) = l.accept().await.unwrap();
+        info!("accepted client, trying sockopt");
         unsafe {
             let mut optval: [libc::c_uchar; 256] = [0; 256];
             let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
@@ -130,86 +165,37 @@ async fn main() -> Result<(), anyhow::Error> {
             );
             if ret != 0 {
                 // tokio::time::sleep(Duration::from_millis(10000000)).await;
-                warn!("{:?}", io::Error::last_os_error());
+                warn!("get sock opt: {:?}", io::Error::last_os_error());
             }
             warn!("got val ret={ret} optval={optval:?}");
-            warn!("string val: {:?}", str_from_null_terminated_utf8_safe(&optval[..sz as usize]));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        unsafe {
-            let mut optval: [libc::c_uchar; 256] = get_id(b"from userspace").map(|b| b as libc::c_uchar);
-            let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
-            let ret = libc::setsockopt(
-                s.as_raw_fd(),
-                #[allow(overflowing_literals)]
-                    0xdeadbeef,
-                12,
-                &optval as *const _ as *const libc::c_void,
-                mem::size_of_val(&optval) as libc::socklen_t,
-            );
-            warn!("setsock got val ret={ret} optval={optval:?}");
-            if ret != 0 && ret != -1 {
-                panic!("{:?}", io::Error::last_os_error());
-            }
-        }
-        unsafe {
-            let mut optval: [libc::c_uchar; 256] = [19; 256];
-            let mut sz = (mem::size_of_val(&optval)) as libc::socklen_t;
-            let ret = libc::getsockopt(
-                s.as_raw_fd(),
-                #[allow(overflowing_literals)]
-                    0xdeadbeef,
-                12,
-                &mut optval as *const _ as *mut libc::c_void,
-                &mut sz,
-            );
-            if ret != 0 {
-                panic!("ret={ret} {:?}", io::Error::last_os_error());
-            }
-            warn!("got val ret={ret} optval={optval:?}");
-            warn!("string val: {:?}", str_from_null_terminated_utf8_safe(&optval[..sz as usize]));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    });
-
-    let server: JoinHandle<()> = tokio::spawn(async move {
-        return;
-        let l = TcpListener::bind(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        unsafe {
-            let optval: libc::c_int = 1;
-            let ret = libc::setsockopt(
-                l.as_raw_fd(),
-                0x1eadbeef as i32,
-                6,
-                &optval as *const _ as *const libc::c_void,
-                mem::size_of_val(&optval) as libc::socklen_t,
-            );
-            if ret != 0 {
-                panic!("{:?}", io::Error::last_os_error());
+            let s = str_from_null_terminated_utf8_safe(&optval[..sz as usize]);
+            warn!("string val: {:?}", s);
+            if s != "from userspace" {
+                panic!("got {s}");
             }
         }
 
-        l.accept().await.unwrap();
+        info!("accepted client and got opt");
+        drop(tx);
         tokio::time::sleep(Duration::from_secs(25)).await;
     });
     select! {
         _ = client => {
             info!("client done");
         },
-        // _ = server => {
-        //     info!("server done");
-        // },
+        _ = server => {
+            info!("server done");
+        },
         _ = signal::ctrl_c() => {
 
         }
     }
     ;
-    metadata.iter().for_each(|f| {
+    let m = m.lock().unwrap();
+    m.iter().for_each(|f| {
         let f = f.unwrap();
         let a: ConnectionTuple2 = (&f.0).into();
-        info!("map {a:?} -> {:?}", f.1);
+        info!("map {a:?}",);
     });
     info!("Exiting...");
 
